@@ -102,6 +102,7 @@ def ort_training_session_run_helper(session, iobinding, inputs, input_descs, out
         torch_tensor = torch.zeros(output_desc.shape_, device=device,
                                    dtype=output_desc.eval_dtype_ if hasattr(output_desc, 'eval_dtype_')
                                    else output_desc.dtype_)
+
         iobinding.bind_output(output_desc.name_, torch_tensor.device.type, get_device_index(device),
                               dtype_torch_to_numpy(torch_tensor.dtype),
                               list(torch_tensor.size()), torch_tensor.data_ptr())
@@ -194,10 +195,6 @@ def dtype_torch_to_numpy(torch_dtype):
         return np.int32
     elif torch_dtype == torch.int16 or torch_dtype == torch.short:
         return np.int16
-    elif torch_dtype == torch.bool:
-        return np.bool
-    else:
-        raise Exception("Torch type to numpy type mapping unavailable for: " + str(torch_dtype))
 
 def wrap_for_input_match(model, loss_fn, input_names):
     import inspect
@@ -379,8 +376,7 @@ def create_ort_training_session_with_optimizer(model, device, training_optimizer
                                                deepspeed_zero_stage=0,
                                                enable_grad_norm_clip=True,
                                                frozen_weights=[], opset_version=DEFAULT_OPSET_VERSION,
-                                               use_deterministic_compute=False,
-                                               use_invertible_layernorm_grad=False):
+                                               use_deterministic_compute=False):
     output_name = model.graph.output[0].name
     ort_parameters = ort.TrainingParameters()
     ort_parameters.loss_output_name = output_name
@@ -388,11 +384,11 @@ def create_ort_training_session_with_optimizer(model, device, training_optimizer
     ort_parameters.world_rank = world_rank
     ort_parameters.world_size = world_size
     ort_parameters.gradient_accumulation_steps = gradient_accumulation_steps
+    ort_parameters.use_mixed_precision = use_mixed_precision
     ort_parameters.allreduce_post_accumulation = allreduce_post_accumulation
     ort_parameters.deepspeed_zero_stage = deepspeed_zero_stage
     ort_parameters.enable_grad_norm_clip = enable_grad_norm_clip
     ort_parameters.set_gradients_as_graph_outputs = False
-    ort_parameters.use_invertible_layernorm_grad = use_invertible_layernorm_grad
 
     output_types = {}
     for output in model.graph.output:
@@ -534,8 +530,7 @@ class ORTTrainer():
                  world_rank=0, world_size=1, use_mixed_precision=False, allreduce_post_accumulation=False,
                  global_step=0, get_lr_this_step=None, loss_scaler=None, deepspeed_zero_stage=0,
                  enable_grad_norm_clip=True, frozen_weights=[], _opset_version=DEFAULT_OPSET_VERSION,
-                 _enable_internal_postprocess=True, _extra_postprocess=None, _use_deterministic_compute=False,
-                 use_invertible_layernorm_grad=False):
+                 _enable_internal_postprocess=True, _extra_postprocess=None, _use_deterministic_compute=False):
         super(ORTTrainer, self).__init__()
         """
         Initialize ORTTrainer.
@@ -604,8 +599,6 @@ class ORTTrainer():
                Defaults to True
             _extra_postprocess: a callable to postprocess the ONNX model that is converted from PyTorch.
                Defaults to None
-            use_invertible_layernorm_grad: use invertible layernorm grad
-               Defaults to False
         """
         warnings.warn('DISCLAIMER: This is an early version of an experimental training API and it is subject to change. DO NOT create production applications with it')
         self.is_train = True
@@ -658,13 +651,21 @@ class ORTTrainer():
         self.state_dict_ = None
         self._enable_internal_postprocess = _enable_internal_postprocess
         self._use_deterministic_compute = _use_deterministic_compute
-        self.use_invertible_layernorm_grad = use_invertible_layernorm_grad
 
         # use this special string to workaround a corner case that external loss_scale is passed into train_step as kwargs.
         # see prepare_input_and_fetches for more details.
         self.loss_scale_input_name = 'default_loss_scale_input_name'
 
         self._init_session()
+
+    def test(self):
+        print("success")
+
+    def _force_init_model(self, *args, **kwargs):
+        # testing purposes only
+        if self.onnx_model_ is None:
+            sample_input, _ = self._prepare_input_and_fetches(self.model_desc_.inputs_, None, None, *args, **kwargs)
+            self._init_onnx_model(sample_input)
 
     def _init_session(self):
         if self.onnx_model_ is None:
@@ -687,8 +688,7 @@ class ORTTrainer():
                 deepspeed_zero_stage=self.deepspeed_zero_stage_,
                 enable_grad_norm_clip=self.enable_grad_norm_clip_,
                 frozen_weights=self.frozen_weights_, opset_version=self.opset_version_,
-                use_deterministic_compute=self._use_deterministic_compute,
-                use_invertible_layernorm_grad=self.use_invertible_layernorm_grad)
+                use_deterministic_compute=self._use_deterministic_compute)
 
         self.loss_scale_input_name = self.session.loss_scale_input_name
 
@@ -815,6 +815,11 @@ class ORTTrainer():
         with open(path, "wb") as f:
             f.write(self.onnx_model_.SerializeToString())
 
+    def _get_onnx(self):
+        state_tensors = self.session.get_state()
+        self._update_onnx_model_initializers(state_tensors)
+        return self.onnx_model_
+
     def _prepare_input_and_fetches(self, input_desc_with_, internal_learning_rate, internal_loss_scale, *args, **kwargs):
         fetches = None
         if type(args) == tuple and len(args) == 1 and type(args[0]) == list:
@@ -866,8 +871,7 @@ class ORTTrainer():
         #   it optionally contains the fetches.
         # localized arguments (*args) contains inputs to the ONNX model.
         # named arguments can contain both inputs, learning_rate and loss_scale, and the fetches
-
-
+        
         learning_rate, loss_scale = None, None
         if self.get_lr_this_step_ is not None:
             # $args, **kwargs contains inputs to the pytorch model
@@ -880,7 +884,7 @@ class ORTTrainer():
             sample_input, _ = self._prepare_input_and_fetches(self.model_desc_.inputs_,
                 None, None, *args, **kwargs)
             self._init_onnx_model(sample_input)
-
+        
         if self.use_mixed_precision:
             input, fetches = self._prepare_input_and_fetches(self.input_desc_with_lr_and_loss_scale,
                 learning_rate, loss_scale, *args, **kwargs)
@@ -892,6 +896,25 @@ class ORTTrainer():
             assert len(self.input_desc_with_lr) == len(input)
             input_descs = self.input_desc_with_lr
 
+        # start model comparison
+        if self.current_step == 0:
+            self.torch_model_.train()
+            # eventually fix to use the same optimizer
+            if self.training_optimizer_name_ == "LambOptimizer" or self.training_optimizer_name_ == "SGDOptimizer":
+                self.torch_optimizer_ = torch.optim.SGD(self.torch_model_.parameters(), lr=args[-1].item())
+        self.torch_optimizer_.zero_grad()
+        cpu_data = args[0]
+        cpu_data = cpu_data.to('cpu')
+        cpu_target = args[1]
+        cpu_target = cpu_target.to('cpu')
+        torch_out = self.torch_model_(cpu_data)
+        self.torch_loss_ = self.loss_fn_(torch_out, cpu_target) #this fn automatically does .view(-1, 28785)
+        self.torch_loss_.backward()
+        torch.nn.utils.clip_grad_norm_(self.torch_model_.parameters(), 0.5) # is this needed?
+        self.torch_optimizer_.step()
+
+        # end model comparison
+        
         self.current_step += 1
 
         # handle gradient accumulation in fully optimized mode
@@ -902,6 +925,7 @@ class ORTTrainer():
         elif self.current_step % self.gradient_accumulation_steps != 0:
             run_options = ort.RunOptions()
             run_options.only_execute_path_to_fetches = True
+            run_options.training_mode = True
             output_desc = self.output_desc_with_group_accumulated_gradients
         elif self.use_mixed_precision:
             has_if_all_finite = True
@@ -942,6 +966,9 @@ class ORTTrainer():
             results = [session_run_results[output_desc.name_] for output_desc in self.model_desc_.outputs_]
 
         return results[0] if len(results) == 1 else results
+
+    def get_torch_cur_loss(self):
+        return self.torch_loss_.item()
 
     def __call__(self, *args, **kwargs):
         if self.is_train:
