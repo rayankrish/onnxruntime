@@ -667,9 +667,29 @@ class ORTTrainer():
             sample_input, _ = self._prepare_input_and_fetches(self.model_desc_.inputs_, None, None, *args, **kwargs)
             self._init_onnx_model(sample_input)
 
+    def _debug_init_session(self):
+        self.no_postprocess_onnx_model = None
+        if not self._enable_internal_postprocess or not self._extra_postprocess:
+            self.no_postprocess_onnx_model = self.onnx_model_
+                
+            self.no_postprocess_session, self.no_postprocess_train_io_binding, self.no_postprocess_eval_io_binding, self.no_postprocess_output_name, _, self.no_postprocess_output_types = \
+                create_ort_training_session_with_optimizer(
+                    self.onnx_model_, self.device_,
+                    self.training_optimizer_name_, self.learning_rate_description_.name_, self.map_optimizer_attributes_,
+                    self.world_rank, self.world_size,
+                    self.gradient_accumulation_steps, bind_parameters=False,
+                    use_mixed_precision=self.use_mixed_precision, allreduce_post_accumulation=self.allreduce_post_accumulation_,
+                    deepspeed_zero_stage=self.deepspeed_zero_stage_,
+                    enable_grad_norm_clip=self.enable_grad_norm_clip_,
+                    frozen_weights=self.frozen_weights_, opset_version=self.opset_version_,
+                use_deterministic_compute=self._use_deterministic_compute)
+    
     def _init_session(self):
         if self.onnx_model_ is None:
             return
+
+        # TODO: do this only if flag is set
+        self._debug_init_session()
 
         if self._enable_internal_postprocess:
             self._onnx_model_ = postprocess.run_postprocess(self.onnx_model_)
@@ -895,26 +915,7 @@ class ORTTrainer():
                 learning_rate, loss_scale, *args, **kwargs)
             assert len(self.input_desc_with_lr) == len(input)
             input_descs = self.input_desc_with_lr
-
-        # start model comparison
-        if self.current_step == 0:
-            self.torch_model_.train()
-            # eventually fix to use the same optimizer
-            if self.training_optimizer_name_ == "LambOptimizer" or self.training_optimizer_name_ == "SGDOptimizer":
-                self.torch_optimizer_ = torch.optim.SGD(self.torch_model_.parameters(), lr=args[-1].item())
-        self.torch_optimizer_.zero_grad()
-        cpu_data = args[0]
-        cpu_data = cpu_data.to('cpu')
-        cpu_target = args[1]
-        cpu_target = cpu_target.to('cpu')
-        torch_out = self.torch_model_(cpu_data)
-        self.torch_loss_ = self.loss_fn_(torch_out, cpu_target) #this fn automatically does .view(-1, 28785)
-        self.torch_loss_.backward()
-        torch.nn.utils.clip_grad_norm_(self.torch_model_.parameters(), 0.5) # is this needed?
-        self.torch_optimizer_.step()
-
-        # end model comparison
-        
+ 
         self.current_step += 1
 
         # handle gradient accumulation in fully optimized mode
@@ -932,9 +933,45 @@ class ORTTrainer():
             output_desc = self.output_desc_with_all_fp_16_or_fp32_gradients_finite
         else:
             output_desc = self.model_desc_.outputs_
-
+        
         if not isinstance(input, (list, tuple)):
             input = (input,)
+        
+        # DEBUG ONLY
+        no_postprocess_run_options = ort.RunOptions()
+        no_postprocess_run_options.only_execute_path_to_fetches = True
+        no_postprocess_run_options.training_mode = False
+        #no_postprocess_output_desc = self.output_desc_with_group_accumulated_gradients
+        no_postprocess_output_desc = output_desc
+        no_postprocess_session_results= ort_training_session_run_helper(self.no_postprocess_session, self.no_postprocess_train_io_binding, input,
+                                                              input_descs, no_postprocess_output_desc,
+                                                              self.device_,
+                                                              no_postprocess_run_options)
+        #print(no_postprocess_session_results[self.model_desc_.outputs_[1].name_].size())
+        
+
+        postprocess_session_results = ort_training_session_run_helper(self.session, self.train_io_binding, input,
+                                                              input_descs, output_desc,
+                                                              self.device_,
+                                                              no_postprocess_run_options)
+        cpu_data = input[0].to('cpu')
+        with torch.no_grad(): torch_out = [self.torch_model_(cpu_data)]#.cpu().numpy().flatten()
+        # iterate through outputs, except loss
+        torch_out.insert(0, torch.empty(1, 1))
+        for ((out_name, npp_out), pp_out, t_out) in zip(no_postprocess_session_results.items(), postprocess_session_results.values(), torch_out):
+            if out_name == 'loss': continue
+            no_postprocess_out = npp_out.cpu().numpy().flatten()
+            #no_postprocess_session_results[self.model_desc_.outputs_[1].name_].cpu().numpy().flatten() #is this general??
+            postprocess_out = pp_out.cpu().numpy().flatten()
+            #postprocess_session_results[self.model_desc_.outputs_[1].name_].cpu().numpy().flatten()
+            t_out = t_out.cpu().numpy().flatten()
+            #print("no pp {} | pp {} | torch {} ".format(no_postprocess_out.mean(), postprocess_out.mean(), t_out.mean()))
+            print("No Post-Processing vs PyTorch: ", end='')
+            print(np.absolute(np.absolute(no_postprocess_out)-np.absolute(t_out)).mean())
+            print("Post-Processing vs PyTorch:    ", end='')
+            print(np.absolute(np.absolute(postprocess_out)-np.absolute(t_out)).mean())
+
+        # END DEBUG
 
         session_run_results = ort_training_session_run_helper(self.session, self.train_io_binding, input,
                                                               input_descs, output_desc,
@@ -965,9 +1002,39 @@ class ORTTrainer():
         else:
             results = [session_run_results[output_desc.name_] for output_desc in self.model_desc_.outputs_]
 
+        # start model comparison
+        """
+        if self.current_step == 1:
+            self.torch_model_.train()
+            # eventually fix to add other optimizers (Lamb, Adam)
+            if self.training_optimizer_name_ == "SGDOptimizer":
+                self.torch_optimizer_ = torch.optim.SGD(self.torch_model_.parameters(), lr=args[-1].item())
+        self.torch_optimizer_.zero_grad()
+        cpu_data = args[0]
+        cpu_data = cpu_data.to('cpu')
+        cpu_target = args[1]
+        cpu_target = cpu_target.to('cpu')
+        torch_out = self.torch_model_(cpu_data)
+        self.torch_loss_ = self.loss_fn_(torch_out, cpu_target) #this fn automatically does .view(-1, 28785)
+        self.torch_loss_.backward()
+        torch.nn.utils.clip_grad_norm_(self.torch_model_.parameters(), 0.5) # is this needed?
+        self.torch_optimizer_.step()
+        
+        # test output of losses. TODO: actual inference
+        with torch.no_grad():
+            ort_output = self.eval_step(args[0], args[1], fetches=[self.model_desc_.outputs_[1].name_])
+            torch_model_output = self.torch_model_(cpu_data)
+            ort_np = ort_output.cpu().numpy().flatten()
+            torch_np = torch_model_output.cpu().numpy().flatten()
+            error = np.absolute(ort_np-torch_np).mean()
+        """
+        self.torch_loss_= None
+        # end model comparison
+        
         return results[0] if len(results) == 1 else results
 
     def get_torch_cur_loss(self):
+        if not self.torch_loss_: return 0
         return self.torch_loss_.item()
 
     def __call__(self, *args, **kwargs):
