@@ -535,7 +535,7 @@ class ORTTrainer():
                  global_step=0, get_lr_this_step=None, loss_scaler=None, deepspeed_zero_stage=0,
                  enable_grad_norm_clip=True, frozen_weights=[], _opset_version=DEFAULT_OPSET_VERSION,
                  _enable_internal_postprocess=True, _extra_postprocess=None, _use_deterministic_compute=False,
-                 use_invertible_layernorm_grad=False, _debug_conversion=True):
+                 use_invertible_layernorm_grad=False, _debug_conversion=False):
         super(ORTTrainer, self).__init__()
         """
         Initialize ORTTrainer.
