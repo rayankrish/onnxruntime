@@ -102,7 +102,6 @@ def ort_training_session_run_helper(session, iobinding, inputs, input_descs, out
         torch_tensor = torch.zeros(output_desc.shape_, device=device,
                                    dtype=output_desc.eval_dtype_ if hasattr(output_desc, 'eval_dtype_')
                                    else output_desc.dtype_)
-
         iobinding.bind_output(output_desc.name_, torch_tensor.device.type, get_device_index(device),
                               dtype_torch_to_numpy(torch_tensor.dtype),
                               list(torch_tensor.size()), torch_tensor.data_ptr())
@@ -195,6 +194,10 @@ def dtype_torch_to_numpy(torch_dtype):
         return np.int32
     elif torch_dtype == torch.int16 or torch_dtype == torch.short:
         return np.int16
+    elif torch_dtype == torch.bool:
+        return np.bool
+    else:
+        raise Exception("Torch type to numpy type mapping unavailable for: " + str(torch_dtype))
 
 def wrap_for_input_match(model, loss_fn, input_names):
     import inspect
@@ -376,7 +379,8 @@ def create_ort_training_session_with_optimizer(model, device, training_optimizer
                                                deepspeed_zero_stage=0,
                                                enable_grad_norm_clip=True,
                                                frozen_weights=[], opset_version=DEFAULT_OPSET_VERSION,
-                                               use_deterministic_compute=False):
+                                               use_deterministic_compute=False,
+                                               use_invertible_layernorm_grad=False):
     output_name = model.graph.output[0].name
     ort_parameters = ort.TrainingParameters()
     ort_parameters.loss_output_name = output_name
@@ -384,11 +388,11 @@ def create_ort_training_session_with_optimizer(model, device, training_optimizer
     ort_parameters.world_rank = world_rank
     ort_parameters.world_size = world_size
     ort_parameters.gradient_accumulation_steps = gradient_accumulation_steps
-    ort_parameters.use_mixed_precision = use_mixed_precision
     ort_parameters.allreduce_post_accumulation = allreduce_post_accumulation
     ort_parameters.deepspeed_zero_stage = deepspeed_zero_stage
     ort_parameters.enable_grad_norm_clip = enable_grad_norm_clip
     ort_parameters.set_gradients_as_graph_outputs = False
+    ort_parameters.use_invertible_layernorm_grad = use_invertible_layernorm_grad
 
     output_types = {}
     for output in model.graph.output:
@@ -530,7 +534,8 @@ class ORTTrainer():
                  world_rank=0, world_size=1, use_mixed_precision=False, allreduce_post_accumulation=False,
                  global_step=0, get_lr_this_step=None, loss_scaler=None, deepspeed_zero_stage=0,
                  enable_grad_norm_clip=True, frozen_weights=[], _opset_version=DEFAULT_OPSET_VERSION,
-                 _enable_internal_postprocess=True, _extra_postprocess=None, _use_deterministic_compute=False):
+                 _enable_internal_postprocess=True, _extra_postprocess=None, _use_deterministic_compute=False,
+                 use_invertible_layernorm_grad=False, _debug_conversion=True):
         super(ORTTrainer, self).__init__()
         """
         Initialize ORTTrainer.
@@ -599,6 +604,11 @@ class ORTTrainer():
                Defaults to True
             _extra_postprocess: a callable to postprocess the ONNX model that is converted from PyTorch.
                Defaults to None
+            use_invertible_layernorm_grad: use invertible layernorm grad
+               Defaults to False
+            _debug_conversion: runs a single inference step on the postprocessed and not postprocessed model
+               to compare with the PyTorch model. A small difference in output indicates model converstion was successful.
+               Defaults to False
         """
         warnings.warn('DISCLAIMER: This is an early version of an experimental training API and it is subject to change. DO NOT create production applications with it')
         self.is_train = True
@@ -651,6 +661,9 @@ class ORTTrainer():
         self.state_dict_ = None
         self._enable_internal_postprocess = _enable_internal_postprocess
         self._use_deterministic_compute = _use_deterministic_compute
+        self.use_invertible_layernorm_grad = use_invertible_layernorm_grad
+
+        self._debug_conversion = _debug_conversion
 
         # use this special string to workaround a corner case that external loss_scale is passed into train_step as kwargs.
         # see prepare_input_and_fetches for more details.
@@ -658,14 +671,6 @@ class ORTTrainer():
 
         self._init_session()
 
-    def test(self):
-        print("success")
-
-    def _force_init_model(self, *args, **kwargs):
-        # testing purposes only
-        if self.onnx_model_ is None:
-            sample_input, _ = self._prepare_input_and_fetches(self.model_desc_.inputs_, None, None, *args, **kwargs)
-            self._init_onnx_model(sample_input)
 
     def _debug_init_session(self):
         self.no_postprocess_onnx_model = None
@@ -683,13 +688,12 @@ class ORTTrainer():
                     enable_grad_norm_clip=self.enable_grad_norm_clip_,
                     frozen_weights=self.frozen_weights_, opset_version=self.opset_version_,
                 use_deterministic_compute=self._use_deterministic_compute)
-    
+
     def _init_session(self):
         if self.onnx_model_ is None:
             return
 
-        # TODO: do this only if flag is set
-        self._debug_init_session()
+        if self._debug_conversion: self._debug_init_session()
 
         if self._enable_internal_postprocess:
             self._onnx_model_ = postprocess.run_postprocess(self.onnx_model_)
@@ -708,7 +712,8 @@ class ORTTrainer():
                 deepspeed_zero_stage=self.deepspeed_zero_stage_,
                 enable_grad_norm_clip=self.enable_grad_norm_clip_,
                 frozen_weights=self.frozen_weights_, opset_version=self.opset_version_,
-                use_deterministic_compute=self._use_deterministic_compute)
+                use_deterministic_compute=self._use_deterministic_compute,
+                use_invertible_layernorm_grad=self.use_invertible_layernorm_grad)
 
         self.loss_scale_input_name = self.session.loss_scale_input_name
 
@@ -835,11 +840,6 @@ class ORTTrainer():
         with open(path, "wb") as f:
             f.write(self.onnx_model_.SerializeToString())
 
-    def _get_onnx(self):
-        state_tensors = self.session.get_state()
-        self._update_onnx_model_initializers(state_tensors)
-        return self.onnx_model_
-
     def _prepare_input_and_fetches(self, input_desc_with_, internal_learning_rate, internal_loss_scale, *args, **kwargs):
         fetches = None
         if type(args) == tuple and len(args) == 1 and type(args[0]) == list:
@@ -870,6 +870,56 @@ class ORTTrainer():
 
         return input, fetches
 
+    def _debug_conversion_step(self, input, input_descs, output_desc):
+        # handle case if onnx model is provided instead of torch
+        if not self.torch_model_: return
+
+        # set up training session for ort models (for inference)
+        no_postprocess_run_options = ort.RunOptions()
+        no_postprocess_run_options.only_execute_path_to_fetches = True
+        no_postprocess_run_options.training_mode = False
+        no_postprocess_output_desc = output_desc
+        
+        # handles case in which user specifies no post processing
+        no_postprocess_session_results = {}
+        if self.no_postprocess_onnx_model:
+            no_postprocess_session_results= ort_training_session_run_helper(self.no_postprocess_session, self.no_postprocess_train_io_binding, input,
+                                                                  input_descs, no_postprocess_output_desc,
+                                                                  self.device_,
+                                                                  no_postprocess_run_options)
+
+        postprocess_session_results = ort_training_session_run_helper(self.session, self.train_io_binding, input,
+                                                              input_descs, output_desc,
+                                                              self.device_,
+                                                              no_postprocess_run_options)
+        input_names = [elem.name_ for elem in input_descs]
+        cpu_data_list = []
+        from inspect import signature
+        # trailing inputs for ort optimizer are avoided by considering pytorch inputs directly
+        for i, (name, input_elem) in enumerate(zip(input_names, input)):
+            if i >= len(signature(self.torch_model_.forward).parameters): break
+            cpu_data_list.append(input_elem.to('cpu'))
+        cpu_data = tuple(cpu_data_list)
+
+        # torch inference step
+        with torch.no_grad(): torch_out = [self.torch_model_(*cpu_data)]
+        
+        # iterate through outputs, except loss when loss_fn is distinct from the model
+        if self.loss_fn_: torch_out.insert(0, torch.empty(1, 1))
+        for ((out_name, npp_out), pp_out, t_out) in zip(no_postprocess_session_results.items(), postprocess_session_results.values(), torch_out):
+            if out_name == 'loss' and self.loss_fn_: continue
+            no_postprocess_out = npp_out.cpu().numpy().flatten()
+            postprocess_out = pp_out.cpu().numpy().flatten()
+            t_out = t_out.cpu().numpy().flatten()
+            print("Comparing Values of {}".format(out_name))
+            if self.no_postprocess_onnx_model:
+                print("No Post-Processing vs PyTorch: ", end='')
+                print(np.absolute(np.absolute(no_postprocess_out)-np.absolute(t_out)).mean())
+                print("Post-Processing vs PyTorch:    ", end='')
+                print(np.absolute(np.absolute(postprocess_out)-np.absolute(t_out)).mean())
+            else:
+                print("No Post-Processing vs PyTorch: ", end='')
+                print(np.absolute(np.absolute(postprocess_out)-np.absolute(t_out)).mean())
 
     def train_step(self, *args, **kwargs):
         """
@@ -891,7 +941,8 @@ class ORTTrainer():
         #   it optionally contains the fetches.
         # localized arguments (*args) contains inputs to the ONNX model.
         # named arguments can contain both inputs, learning_rate and loss_scale, and the fetches
-        
+
+
         learning_rate, loss_scale = None, None
         if self.get_lr_this_step_ is not None:
             # $args, **kwargs contains inputs to the pytorch model
@@ -904,7 +955,7 @@ class ORTTrainer():
             sample_input, _ = self._prepare_input_and_fetches(self.model_desc_.inputs_,
                 None, None, *args, **kwargs)
             self._init_onnx_model(sample_input)
-        
+
         if self.use_mixed_precision:
             input, fetches = self._prepare_input_and_fetches(self.input_desc_with_lr_and_loss_scale,
                 learning_rate, loss_scale, *args, **kwargs)
@@ -915,7 +966,7 @@ class ORTTrainer():
                 learning_rate, loss_scale, *args, **kwargs)
             assert len(self.input_desc_with_lr) == len(input)
             input_descs = self.input_desc_with_lr
- 
+
         self.current_step += 1
 
         # handle gradient accumulation in fully optimized mode
@@ -926,52 +977,17 @@ class ORTTrainer():
         elif self.current_step % self.gradient_accumulation_steps != 0:
             run_options = ort.RunOptions()
             run_options.only_execute_path_to_fetches = True
-            run_options.training_mode = True
             output_desc = self.output_desc_with_group_accumulated_gradients
         elif self.use_mixed_precision:
             has_if_all_finite = True
             output_desc = self.output_desc_with_all_fp_16_or_fp32_gradients_finite
         else:
             output_desc = self.model_desc_.outputs_
-        
+
         if not isinstance(input, (list, tuple)):
             input = (input,)
-        
-        # DEBUG ONLY
-        no_postprocess_run_options = ort.RunOptions()
-        no_postprocess_run_options.only_execute_path_to_fetches = True
-        no_postprocess_run_options.training_mode = False
-        #no_postprocess_output_desc = self.output_desc_with_group_accumulated_gradients
-        no_postprocess_output_desc = output_desc
-        no_postprocess_session_results= ort_training_session_run_helper(self.no_postprocess_session, self.no_postprocess_train_io_binding, input,
-                                                              input_descs, no_postprocess_output_desc,
-                                                              self.device_,
-                                                              no_postprocess_run_options)
-        #print(no_postprocess_session_results[self.model_desc_.outputs_[1].name_].size())
-        
 
-        postprocess_session_results = ort_training_session_run_helper(self.session, self.train_io_binding, input,
-                                                              input_descs, output_desc,
-                                                              self.device_,
-                                                              no_postprocess_run_options)
-        cpu_data = input[0].to('cpu')
-        with torch.no_grad(): torch_out = [self.torch_model_(cpu_data)]#.cpu().numpy().flatten()
-        # iterate through outputs, except loss
-        torch_out.insert(0, torch.empty(1, 1))
-        for ((out_name, npp_out), pp_out, t_out) in zip(no_postprocess_session_results.items(), postprocess_session_results.values(), torch_out):
-            if out_name == 'loss': continue
-            no_postprocess_out = npp_out.cpu().numpy().flatten()
-            #no_postprocess_session_results[self.model_desc_.outputs_[1].name_].cpu().numpy().flatten() #is this general??
-            postprocess_out = pp_out.cpu().numpy().flatten()
-            #postprocess_session_results[self.model_desc_.outputs_[1].name_].cpu().numpy().flatten()
-            t_out = t_out.cpu().numpy().flatten()
-            #print("no pp {} | pp {} | torch {} ".format(no_postprocess_out.mean(), postprocess_out.mean(), t_out.mean()))
-            print("No Post-Processing vs PyTorch: ", end='')
-            print(np.absolute(np.absolute(no_postprocess_out)-np.absolute(t_out)).mean())
-            print("Post-Processing vs PyTorch:    ", end='')
-            print(np.absolute(np.absolute(postprocess_out)-np.absolute(t_out)).mean())
-
-        # END DEBUG
+        if self._debug_conversion and self.current_step is 1: self._debug_conversion_step(input, input_descs, output_desc)
 
         session_run_results = ort_training_session_run_helper(self.session, self.train_io_binding, input,
                                                               input_descs, output_desc,
@@ -1002,40 +1018,7 @@ class ORTTrainer():
         else:
             results = [session_run_results[output_desc.name_] for output_desc in self.model_desc_.outputs_]
 
-        # start model comparison
-        """
-        if self.current_step == 1:
-            self.torch_model_.train()
-            # eventually fix to add other optimizers (Lamb, Adam)
-            if self.training_optimizer_name_ == "SGDOptimizer":
-                self.torch_optimizer_ = torch.optim.SGD(self.torch_model_.parameters(), lr=args[-1].item())
-        self.torch_optimizer_.zero_grad()
-        cpu_data = args[0]
-        cpu_data = cpu_data.to('cpu')
-        cpu_target = args[1]
-        cpu_target = cpu_target.to('cpu')
-        torch_out = self.torch_model_(cpu_data)
-        self.torch_loss_ = self.loss_fn_(torch_out, cpu_target) #this fn automatically does .view(-1, 28785)
-        self.torch_loss_.backward()
-        torch.nn.utils.clip_grad_norm_(self.torch_model_.parameters(), 0.5) # is this needed?
-        self.torch_optimizer_.step()
-        
-        # test output of losses. TODO: actual inference
-        with torch.no_grad():
-            ort_output = self.eval_step(args[0], args[1], fetches=[self.model_desc_.outputs_[1].name_])
-            torch_model_output = self.torch_model_(cpu_data)
-            ort_np = ort_output.cpu().numpy().flatten()
-            torch_np = torch_model_output.cpu().numpy().flatten()
-            error = np.absolute(ort_np-torch_np).mean()
-        """
-        self.torch_loss_= None
-        # end model comparison
-        
         return results[0] if len(results) == 1 else results
-
-    def get_torch_cur_loss(self):
-        if not self.torch_loss_: return 0
-        return self.torch_loss_.item()
 
     def __call__(self, *args, **kwargs):
         if self.is_train:
