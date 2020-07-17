@@ -535,7 +535,7 @@ class ORTTrainer():
                  global_step=0, get_lr_this_step=None, loss_scaler=None, deepspeed_zero_stage=0,
                  enable_grad_norm_clip=True, frozen_weights=[], _opset_version=DEFAULT_OPSET_VERSION,
                  _enable_internal_postprocess=True, _extra_postprocess=None, _use_deterministic_compute=False,
-                 use_invertible_layernorm_grad=False, _debug_conversion=False):
+                 use_invertible_layernorm_grad=False, _debug_onnx_model_conversion=False):
         super(ORTTrainer, self).__init__()
         """
         Initialize ORTTrainer.
@@ -606,8 +606,11 @@ class ORTTrainer():
                Defaults to None
             use_invertible_layernorm_grad: use invertible layernorm grad
                Defaults to False
-            _debug_conversion: runs a single inference step on the postprocessed and not postprocessed model
-               to compare with the PyTorch model. A small difference in output indicates model converstion was successful.
+            _debug_onnx_model_conversion: runs a single inference step on the postprocessed ONNX model  and not postprocessed ONNX model
+               to compare with the PyTorch model. A small difference in output indicates model conversion was successful.
+               If _enable_internal_postprocess is set to False and _extra_postprocess is None, the PyTorch model will only
+               be compared with the ONNX model before postprocessing. If the output after conversion is within a reasonable
+               threshold, training continues. If it isn't, an error is produced. The PyTorch model is stored and runs on CPU.
                Defaults to False
         """
         warnings.warn('DISCLAIMER: This is an early version of an experimental training API and it is subject to change. DO NOT create production applications with it')
@@ -663,7 +666,7 @@ class ORTTrainer():
         self._use_deterministic_compute = _use_deterministic_compute
         self.use_invertible_layernorm_grad = use_invertible_layernorm_grad
 
-        self._debug_conversion = _debug_conversion
+        self._debug_onnx_model_conversion = _debug_onnx_model_conversion
 
         # use this special string to workaround a corner case that external loss_scale is passed into train_step as kwargs.
         # see prepare_input_and_fetches for more details.
@@ -672,14 +675,19 @@ class ORTTrainer():
         self._init_session()
 
 
-    def _debug_init_session(self):
-        self.no_postprocess_onnx_model = None
-        if not self._enable_internal_postprocess or not self._extra_postprocess:
-            self.no_postprocess_onnx_model = self.onnx_model_
+    def _debug_init_session(self, inputs):
+        self._no_postprocess_onnx_model = None
+        if not self._debug_onnx_model_conversion:
+            return
+        if not self.torch_model_:
+            return
+        if self._enable_internal_postprocess or self._extra_postprocess:
+            self._no_postprocess_onnx_model = convert_model_loss_fn_to_onnx(
+                self.torch_model_, self.loss_fn_, self.model_desc_, torch.device('cpu'), inputs, opset_version=self.opset_version_, _enable_internal_postprocess=False)
                 
-            self.no_postprocess_session, self.no_postprocess_train_io_binding, self.no_postprocess_eval_io_binding, self.no_postprocess_output_name, _, self.no_postprocess_output_types = \
+            self._no_postprocess_session, self._no_postprocess_train_io_binding, self._no_postprocess_eval_io_binding, self._no_postprocess_output_name, _, self._no_postprocess_output_types = \
                 create_ort_training_session_with_optimizer(
-                    self.onnx_model_, self.device_,
+                    self._no_postprocess_onnx_model, self.device_,
                     self.training_optimizer_name_, self.learning_rate_description_.name_, self.map_optimizer_attributes_,
                     self.world_rank, self.world_size,
                     self.gradient_accumulation_steps, bind_parameters=False,
@@ -693,14 +701,12 @@ class ORTTrainer():
         if self.onnx_model_ is None:
             return
 
-        if self._debug_conversion: self._debug_init_session()
-
         if self._enable_internal_postprocess:
             self._onnx_model_ = postprocess.run_postprocess(self.onnx_model_)
 
         if self._extra_postprocess:
             self._extra_postprocess(self.onnx_model_)
-
+        
         self._verify_fully_optimized_model(self.onnx_model_)
         self.session, self.train_io_binding, self.eval_io_binding, self.output_name, _, self.output_types = \
             create_ort_training_session_with_optimizer(
@@ -759,6 +765,9 @@ class ORTTrainer():
             self.frozen_weights_ = self.frozen_weights_ + torch_buffers
             self.onnx_model_ = convert_model_loss_fn_to_onnx(
                 self.torch_model_, self.loss_fn_, self.model_desc_, torch.device('cpu'), inputs, opset_version=self.opset_version_, _enable_internal_postprocess=self._enable_internal_postprocess)
+            
+            if self._debug_onnx_model_conversion:
+                self._debug_init_session(inputs)
 
         self._init_session()
 
@@ -870,9 +879,10 @@ class ORTTrainer():
 
         return input, fetches
 
-    def _debug_conversion_step(self, input, input_descs, output_desc):
+    def _compare_inference_output_pytorch_onnx(self, input, input_descs, output_desc):
         # handle case if onnx model is provided instead of torch
-        if not self.torch_model_: return
+        if not self.torch_model_:
+            return
 
         # set up training session for ort models (for inference)
         no_postprocess_run_options = ort.RunOptions()
@@ -881,17 +891,20 @@ class ORTTrainer():
         no_postprocess_output_desc = output_desc
         
         # handles case in which user specifies no post processing
-        no_postprocess_session_results = {}
-        if self.no_postprocess_onnx_model:
-            no_postprocess_session_results= ort_training_session_run_helper(self.no_postprocess_session, self.no_postprocess_train_io_binding, input,
-                                                                  input_descs, no_postprocess_output_desc,
-                                                                  self.device_,
-                                                                  no_postprocess_run_options)
-
         postprocess_session_results = ort_training_session_run_helper(self.session, self.train_io_binding, input,
                                                               input_descs, output_desc,
                                                               self.device_,
                                                               no_postprocess_run_options)
+        
+        no_postprocess_session_results = {}
+        if self._no_postprocess_onnx_model:
+            no_postprocess_session_results= ort_training_session_run_helper(self._no_postprocess_session, self._no_postprocess_train_io_binding, input,
+                                                                  input_descs, no_postprocess_output_desc,
+                                                                  self.device_,
+                                                                  no_postprocess_run_options)
+        else:
+            no_postprocess_session_results = postprocess_session_results # filler values not used
+
         input_names = [elem.name_ for elem in input_descs]
         cpu_data_list = []
         from inspect import signature
@@ -902,23 +915,26 @@ class ORTTrainer():
         cpu_data = tuple(cpu_data_list)
 
         # torch inference step
-        with torch.no_grad(): torch_out = [self.torch_model_(*cpu_data)]
+        with torch.no_grad():
+            torch_out = [self.torch_model_(*cpu_data)]
         
         # iterate through outputs, except loss when loss_fn is distinct from the model
-        if self.loss_fn_: torch_out.insert(0, torch.empty(1, 1))
+        if self.loss_fn_:
+            torch_out.insert(0, torch.empty(1, 1))
         for ((out_name, npp_out), pp_out, t_out) in zip(no_postprocess_session_results.items(), postprocess_session_results.values(), torch_out):
-            if out_name == 'loss' and self.loss_fn_: continue
+            if out_name == 'loss' and self.loss_fn_:
+                continue
             no_postprocess_out = npp_out.cpu().numpy().flatten()
             postprocess_out = pp_out.cpu().numpy().flatten()
             t_out = t_out.cpu().numpy().flatten()
             print("Comparing Values of {}".format(out_name))
-            if self.no_postprocess_onnx_model:
-                print("No Post-Processing vs PyTorch: ", end='')
+            if self._no_postprocess_onnx_model:
+                print("PyTorch vs ONNX before post processing: ", end='')
                 print(np.absolute(np.absolute(no_postprocess_out)-np.absolute(t_out)).mean())
-                print("Post-Processing vs PyTorch:    ", end='')
+                print("PyTorch vs ONNX after  post processing: ", end='')
                 print(np.absolute(np.absolute(postprocess_out)-np.absolute(t_out)).mean())
             else:
-                print("No Post-Processing vs PyTorch: ", end='')
+                print("PyTorch vs ONNX without post processing: ", end='')
                 print(np.absolute(np.absolute(postprocess_out)-np.absolute(t_out)).mean())
 
     def train_step(self, *args, **kwargs):
@@ -987,7 +1003,8 @@ class ORTTrainer():
         if not isinstance(input, (list, tuple)):
             input = (input,)
 
-        if self._debug_conversion and self.current_step is 1: self._debug_conversion_step(input, input_descs, output_desc)
+        if self._debug_onnx_model_conversion and self.current_step == 1:
+            self._compare_inference_output_pytorch_onnx(input, input_descs, output_desc)
 
         session_run_results = ort_training_session_run_helper(self.session, self.train_io_binding, input,
                                                               input_descs, output_desc,
