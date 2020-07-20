@@ -610,7 +610,8 @@ class ORTTrainer():
                to compare with the PyTorch model. A small difference in output indicates model conversion was successful.
                If _enable_internal_postprocess is set to False and _extra_postprocess is None, the PyTorch model will only
                be compared with the ONNX model before postprocessing. If the output after conversion is within a reasonable
-               threshold, training continues. If it isn't, an error is produced. The PyTorch model is stored and runs on CPU.
+               threshold, training continues. If it isn't, a warning is produced. The PyTorch model is stored and runs on CPU.
+               Uses 0.01 as threshold value for comparison.
                Defaults to False
         """
         warnings.warn('DISCLAIMER: This is an early version of an experimental training API and it is subject to change. DO NOT create production applications with it')
@@ -667,6 +668,7 @@ class ORTTrainer():
         self.use_invertible_layernorm_grad = use_invertible_layernorm_grad
 
         self._debug_onnx_model_conversion = _debug_onnx_model_conversion
+        self._tolerance = 0.01
 
         # use this special string to workaround a corner case that external loss_scale is passed into train_step as kwargs.
         # see prepare_input_and_fetches for more details.
@@ -696,6 +698,8 @@ class ORTTrainer():
                     enable_grad_norm_clip=self.enable_grad_norm_clip_,
                     frozen_weights=self.frozen_weights_, opset_version=self.opset_version_,
                 use_deterministic_compute=self._use_deterministic_compute)
+        #print(id(self.onnx_model_))
+        #print(id(self._no_postprocess_onnx_model))
 
     def _init_session(self):
         if self.onnx_model_ is None:
@@ -886,7 +890,6 @@ class ORTTrainer():
 
         # set up training session for ort models (for inference)
         no_postprocess_run_options = ort.RunOptions()
-        no_postprocess_run_options.only_execute_path_to_fetches = True
         no_postprocess_run_options.training_mode = False
         no_postprocess_output_desc = output_desc
         
@@ -910,7 +913,8 @@ class ORTTrainer():
         from inspect import signature
         # trailing inputs for ort optimizer are avoided by considering pytorch inputs directly
         for i, (name, input_elem) in enumerate(zip(input_names, input)):
-            if i >= len(signature(self.torch_model_.forward).parameters): break
+            if i >= len(signature(self.torch_model_.forward).parameters):
+                break
             cpu_data_list.append(input_elem.to('cpu'))
         cpu_data = tuple(cpu_data_list)
 
@@ -922,7 +926,8 @@ class ORTTrainer():
         if self.loss_fn_:
             torch_out.insert(0, torch.empty(1, 1))
         for ((out_name, npp_out), pp_out, t_out) in zip(no_postprocess_session_results.items(), postprocess_session_results.values(), torch_out):
-            if out_name == 'loss' and self.loss_fn_:
+            # the first item of outputs must be 'loss' or some variant
+            if out_name == output_desc[0].name_ and self.loss_fn_:
                 continue
             no_postprocess_out = npp_out.cpu().numpy().flatten()
             postprocess_out = pp_out.cpu().numpy().flatten()
@@ -933,9 +938,36 @@ class ORTTrainer():
                 print(np.absolute(np.absolute(no_postprocess_out)-np.absolute(t_out)).mean())
                 print("PyTorch vs ONNX after  post processing: ", end='')
                 print(np.absolute(np.absolute(postprocess_out)-np.absolute(t_out)).mean())
+
+                # compare
+                import math
+                successful_conversion = True
+                for _torch, _ort in zip(t_out.tolist(), no_postprocess_out.tolist()):
+                    if not math.isclose(_torch, _ort, abs_tol=self._tolerance):
+                       warnings.warn("PyTorch model outputs differ from the ORT Model before Post Processing!")
+                       successful_conversion = False
+                       break
+                for _torch, _ort in zip(t_out.tolist(), postprocess_out.tolist()):
+                    if not math.isclose(_torch, _ort, abs_tol=self._tolerance):
+                       warnings.warn("PyTorch model outputs differ from the ORT Model after Post Processing!")
+                       successful_conversion = False
+                       break
+                if successful_conversion:
+                    print("ORT model conversion successful")
             else:
                 print("PyTorch vs ONNX without post processing: ", end='')
                 print(np.absolute(np.absolute(postprocess_out)-np.absolute(t_out)).mean())
+                
+                # compare
+                import math
+                successful_conversion = True
+                for _torch, _ort in zip(t_out.tolist(), postprocess_out.tolist()):
+                    if not math.isclose(_torch, _ort, abs_tol=self._tolerance):
+                       warnings.warn("PyTorch model outputs differ from the ORT Model without Post Processing!")
+                       successful_conversion = False
+                       break
+                if successful_conversion:
+                    print("ORT model conversion successful")
 
     def train_step(self, *args, **kwargs):
         """
