@@ -122,7 +122,7 @@ class ORTTrainer(object):
             "'optim_config' is required and must be any of 'AdamConfig', 'LambConfig' or 'SGDConfig'"
         assert loss_fn is None or (callable(loss_fn) and len(signature(loss_fn).parameters) == 2),\
             "'loss_fn' must be either 'None' or a callable with two parameters"
-        assert options is None or isinstance(options, dict),\
+        assert options is None or isinstance(options, ORTTrainerOptions),\
             "'loss_fn' must be either 'None' or 'ORTTrainerOptions'"
 
         #            Model + Loss validation
@@ -151,11 +151,7 @@ class ORTTrainer(object):
         self.model_desc = _ORTTrainerModelDesc(model_desc)
         self.optim_config = optim_config
 
-        if options:
-            self.options = ORTTrainerOptions(options)
-        else:
-            self.options = ORTTrainerOptions()
-
+        self.options = options
 
     def save_as_onnx(self, path):
         r"""Persists ONNX model into :py:attr:`path`
@@ -205,6 +201,30 @@ class ORTTrainer(object):
             sample_input = self._prepare_input_and_fetches(
                 self.model_desc.inputs, None, None, *input, **kwargs)
             self._init_onnx_model(sample_input)
+
+        # update learning rate
+
+        
+        prepared_input = self._prepare_input_and_fetches(self.model_desc.inputs,
+                self.optim_config.lr, None, *input, **kwargs)
+
+        # run options and ouput desc
+        run_options = None
+
+        if not isinstance(input, (list, tuple)):
+            input = (input,)
+
+        session_run_results = self.ort_training_session_run_helper(self._training_session, self._train_io_binding, prepared_input,
+                                                              self.model_desc.inputs, self.model_desc.outputs,
+                                                              self.options.device.id,
+                                                              run_options)
+
+       
+	#global step, current step ++?
+
+        results = [session_run_results[output_desc.name] for output_desc in self.model_desc.outputs]
+
+        return results[0] if len(results) == 1 else results
 
     def eval_step(self, *input, **kwargs):
         r"""Evaluation step method
@@ -474,6 +494,13 @@ class ORTTrainer(object):
             if input_desc[0] in kwargs:
                 input = input + (kwargs[input_desc[0]],)
 
+        added_inputs = 0
+        if lr:
+            input = input + (lr,)
+            added_inputs += 1
+
+        assert len(self.model_desc.inputs)+added_inputs == len(input)
+
         return input
 
     def _update_onnx_model_initializers(self, state_tensors):
@@ -547,8 +574,9 @@ class ORTTrainer(object):
         ort_parameters.training_optimizer_name = self.optim_config.name
         
         print(type(ort_parameters.lr_params_feed_name), type(self.optim_config.lr))
+        print(self.optim_config.params)
 
-        ort_parameters.lr_params_feed_name = str(self.optim_config.lr)
+        ort_parameters.lr_params_feed_name = "Learning_Rate"#str(self.optim_config.lr)
         #ort_parameters.trainable_params = trainable_params
         ort_parameters.weights_to_train = trainable_params
         ort_parameters.optimizer_attributes_map = optimizer_attributes_map
