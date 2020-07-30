@@ -494,6 +494,9 @@ def testInstantiateORTTrainer():
     # element 8 should be string
     int_to_type = [None, torch.float32, torch.uint8, torch.int8, torch.int16, torch.int16, torch.int32, torch.int64, type("test"), torch.bool]
 
+    # check from pb
+    #print(onnx_model.input[0].name)
+
     # check that the first len(forward.parameters) inputs have the same name, dimensions and dtype
     in_str = str(onnx_model.graph.input)
     for i in range(len(sig.parameters.keys())):
@@ -625,9 +628,7 @@ def testTrainStep():
     train_data, val_data, test_data = utils.prepare_data('cpu', 20, 20)
 
     # Train
-    for batch, i in enumerate(range(0, train_data.size(0)-1, 35)):
-        data, targets = utils.get_batch(train_data, i)
-        output = trainer.train_step(data, targets) # removed learning rate here and in model desc
-        break
+    data, targets = utils.get_batch(train_data, 0)
+    output = trainer.train_step(data, targets) # removed learning rate here and in model desc
     for output_elem, model_desc_output in zip(output, model_desc['outputs']):
         assert list(output_elem.size()) == model_desc_output[1]

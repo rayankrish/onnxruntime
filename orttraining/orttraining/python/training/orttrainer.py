@@ -14,7 +14,6 @@ from . import ORTTrainerOptions
 from . import optim
 from .model_desc_validation import _ORTTrainerModelDesc
 
-
 class TrainStepInfo(object):
     r"""Private class used to store runtime information from current train step.
 
@@ -150,9 +149,9 @@ class ORTTrainer(object):
 
         self.model_desc = _ORTTrainerModelDesc(model_desc)
         self.optim_config = optim_config
-
         self.options = options
-
+        self._train_step_info = TrainStepInfo(all_finite=True, step=0, optimizer_config=self.optim_config)
+    
     def save_as_onnx(self, path):
         r"""Persists ONNX model into :py:attr:`path`
 
@@ -202,26 +201,25 @@ class ORTTrainer(object):
                 self.model_desc.inputs, None, None, *input, **kwargs)
             self._init_onnx_model(sample_input)
 
-        # update learning rate
-
+        # Include Learning Rate description 
+        input_desc = [*self.model_desc.inputs, self.model_desc.learning_rate]
         
-        prepared_input = self._prepare_input_and_fetches(self.model_desc.inputs,
+        prepared_input = self._prepare_input_and_fetches(input_desc,
                 self.optim_config.lr, None, *input, **kwargs)
 
-        # run options and ouput desc
+        # run options 
         run_options = None
 
         if not isinstance(input, (list, tuple)):
             input = (input,)
 
-        session_run_results = self.ort_training_session_run_helper(self._training_session, self._train_io_binding, prepared_input,
-                                                              self.model_desc.inputs, self.model_desc.outputs,
-                                                              self.options.device.id,
+        session_run_results = self.ort_training_session_run_helper(self._train_io_binding, prepared_input,
+                                                              input_desc, self.model_desc.outputs,
                                                               run_options)
 
-       
-	#global step, current step ++?
-
+        # update current step
+        self._train_step_info.step += 1
+        
         results = [session_run_results[output_desc.name] for output_desc in self.model_desc.outputs]
 
         return results[0] if len(results) == 1 else results
@@ -255,10 +253,9 @@ class ORTTrainer(object):
         run_options = ort.RunOptions()
         run_options.only_execute_path_to_fetches = True
         run_options.training_mode = False
-        session_run_results = self.ort_training_session_run_helper(self._training_session, self._eval_io_binding, sample_input,
+        session_run_results = self.ort_training_session_run_helper(self._eval_io_binding, sample_input,
                                                               input_desc,
                                                               output_desc,
-                                                              self.options.device.id,
                                                               run_options)
 
         if len(session_run_results) == 1:
@@ -266,12 +263,14 @@ class ORTTrainer(object):
         else:
             return [session_run_results[output_desc.name] for output_desc in output_desc]
     
-    def ort_training_session_run_helper(self, session, iobinding, inputs, input_descs, output_descs, device, run_options=None):
+    def ort_training_session_run_helper(self, iobinding, inputs, input_descs, output_descs, run_options=None):
+        device = self.options.device.id
+        session = self._training_session
+
         for input, input_desc in zip(inputs, input_descs):
             device_index = self.input_get_device_index(input)
             iobinding.bind_input(input_desc.name, input.device.type, device_index, self.dtype_torch_to_numpy(input.dtype),
                                  list(input.size()), input.data_ptr())
-
         output_descs_resolved = output_descs#resolve_symbolic_dimensions(inputs, input_descs, output_descs)
         torch_outputs = {}
         for output_desc in output_descs_resolved:
@@ -495,7 +494,8 @@ class ORTTrainer(object):
                 input = input + (kwargs[input_desc[0]],)
 
         added_inputs = 0
-        if lr:
+        if lr is not None:
+            lr = torch.FloatTensor([lr])
             input = input + (lr,)
             added_inputs += 1
 
@@ -573,11 +573,7 @@ class ORTTrainer(object):
         ort_parameters.set_gradients_as_graph_outputs = False
         ort_parameters.training_optimizer_name = self.optim_config.name
         
-        print(type(ort_parameters.lr_params_feed_name), type(self.optim_config.lr))
-        print(self.optim_config.params)
-
         ort_parameters.lr_params_feed_name = "Learning_Rate"#str(self.optim_config.lr)
-        #ort_parameters.trainable_params = trainable_params
         ort_parameters.weights_to_train = trainable_params
         ort_parameters.optimizer_attributes_map = optimizer_attributes_map
         ort_parameters.optimizer_int_attributes_map = optimizer_int_attributes_map
