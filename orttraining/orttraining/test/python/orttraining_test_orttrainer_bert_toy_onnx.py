@@ -45,31 +45,58 @@ def bert_model_description():
                   'outputs': [('loss', [], True)]}
     return model_desc
 
+def optimizer_parameters(model):
+    no_decay_keys = ["bias", "gamma", "beta", "LayerNorm"]
+    no_decay_param_group = []
+    decay_param_group = []
+    for initializer in model.graph.initializer:
+        if any(key in initializer.name for key in no_decay_keys):
+            no_decay_param_group.append(initializer.name)
+        else:
+            decay_param_group.append(initializer.name)
+    params = [{'params': no_decay_param_group, "alpha": 0.9, "beta": 0.999, "lambda_coef": 0.0, "epsilon": 1e-6},
+              {'params': decay_param_group, "alpha": 0.9, "beta": 0.999, "lambda_coef": 0.01, "epsilon": 1e-6}]    
+    return params
+
 
 ###############################################################################
 # Testing starts here #########################################################
 ###############################################################################
 
-
-def testToyBERTModel():
-    #print(bert_model_description())
+@pytest.mark.parametrize("use_mixed_precision, loss_scaler, gradient_accumulation_steps, allreduce_post_accumulation", [
+    (False, None, 1, False),
+    (True, amp.DynamicLossScaler(), 1, False),
+    (False, None, 4, False),
+    (False, None, 1, True),
+    (False, None, 4, True),
+])
+def testToyBERTModel(use_mixed_precision, loss_scaler, gradient_accumulation_steps, allreduce_post_accumulation):
     model_desc = bert_model_description()
     device = torch.device("cuda", 0)
 
     pytorch_transformer_path = os.path.join('..', '..', '..', 'onnxruntime', 'test', 'testdata')
     bert_onnx_model_path = os.path.join(pytorch_transformer_path, "bert_toy_postprocessed.onnx")
     model = onnx.load(bert_onnx_model_path)
-
-    optim_config = optim.LambConfig()
-    opts = orttrainer.ORTTrainerOptions({
+    
+    params = optimizer_parameters(model)
+    optim_config = optim.LambConfig(params)
+    opts = {
         'debug' : {
             'deterministic_compute': True
         },
         'device' : {
             'id' : "cuda:0",
         }
+    }
 
-    })
+    if use_mixed_precision:
+        opts.update({'mixed_precision': {'enabled':True, 'loss_scaler': loss_scaler}})
+    if gradient_accumulation_steps != 1:
+        opts.update({'batch': {'gradient_accumulation_steps': 1}})
+    if allreduce_post_accumulation:
+        opts.update({'distributed': {'allreduce_post_accumulation': True}})
+
+    opts = orttrainer.ORTTrainerOptions(opts) 
     
     torch.manual_seed(1)
     set_seed(1)
@@ -78,6 +105,5 @@ def testToyBERTModel():
     sample_input = generate_random_input_from_model_desc(model_desc)
 
     output = trainer.train_step(*sample_input)
-    #print(output)
     assert output.shape == torch.Size([]) 
 
